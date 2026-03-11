@@ -1,4 +1,4 @@
-# DorkFi Liquidation Bot
+# DorkFi Liquidation Bot — Voi + Algorand
 
 Automated liquidation bot for [DorkFi](https://dorkfi.com) on the Voi Network.
 

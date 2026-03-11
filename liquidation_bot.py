@@ -1,44 +1,47 @@
 #!/usr/bin/env python3
 """
-DorkFi Liquidation Bot — Voi Network
+DorkFi Liquidation Bot — Voi + Algorand
 Wallet: JV7URAS6XGXG7ZH44CWABWZYRIIJPXOWUVNFIJKLKJ3FRTADX2YWEJNO3A
-Capital: ~$110 aUSDC + 100K VOI
 
 Strategy:
-- Poll DorkFi for liquidation candidates every 5 min
-- Liquidate up to 60% of eligible positions
-- Sell received VOI slowly (10-20%/day) to avoid cascade
+- Poll DorkFi for liquidation candidates on both chains every 5 min
+- Liquidate up to 50% of eligible positions
 - Max $50/trade to preserve capital
+- Skip bad debt (collateral < $1)
+
+Voi:   repay aUSDC, receive VOI (+10% bonus) — sell VOI slowly
+Algo:  repay USDC, receive ALGO (+6% bonus)
 """
 
 import os, json, time, logging, urllib.request, threading, queue, base64
 from datetime import datetime
 from dotenv import load_dotenv
 
-load_dotenv(os.path.expanduser("~/.openclaw/workspace/wad-bot.env"))
+load_dotenv(os.path.expanduser("~/.openclaw/workspace/liq-bot.env"))
 
 from algosdk import mnemonic, account, transaction, encoding
 from algosdk.v2client import algod
 
 # --- Config ---
-VOI_WALLET    = "JV7URAS6XGXG7ZH44CWABWZYRIIJPXOWUVNFIJKLKJ3FRTADX2YWEJNO3A"
-AUSDC_ID      = 302190
-VOI_NODELY    = "https://mainnet-api.voi.nodely.dev"
+WALLET        = "JV7URAS6XGXG7ZH44CWABWZYRIIJPXOWUVNFIJKLKJ3FRTADX2YWEJNO3A"
 MCP_URL       = "http://localhost:3000"
 STATE_FILE    = os.path.expanduser("~/.openclaw/workspace/liq_bot_state.json")
 LOG_FILE      = os.path.expanduser("~/.openclaw/workspace/liq_bot_output.log")
-MAX_PER_TRADE = 50.0   # max aUSDC per liquidation
-MIN_DEVIATION = 0.05   # only liquidate if health factor < 0.95 (5% buffer)
-VOI_SELL_PCT  = 0.15   # sell 15% of VOI holdings per day max
+MAX_PER_TRADE = 50.0   # max USD per liquidation
+
+# Voi
+VOI_NODELY    = "https://mainnet-api.voi.nodely.dev"
+AUSDC_VOI_ID  = 302190
+
+# Algorand
+ALGO_NODE     = "https://mainnet-api.algonode.cloud"
+USDC_ALGO_ID  = 31566704
 
 # --- Logging ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler()]
 )
 log = logging.getLogger(__name__)
 
@@ -47,15 +50,17 @@ BOT_MNEMONIC = os.environ.get("LIQUIDATION_BOT_MNEMONIC", "")
 if not BOT_MNEMONIC:
     raise EnvironmentError("LIQUIDATION_BOT_MNEMONIC not set in environment")
 private_key  = mnemonic.to_private_key(BOT_MNEMONIC)
-assert account.address_from_private_key(private_key) == VOI_WALLET, "Key mismatch — check LIQUIDATION_BOT_MNEMONIC"
-voi_client   = algod.AlgodClient("", VOI_NODELY, headers={"X-Algo-API-Token": ""})
+assert account.address_from_private_key(private_key) == WALLET, "Key mismatch"
+
+voi_client  = algod.AlgodClient("", VOI_NODELY, headers={"X-Algo-API-Token": ""})
+algo_client = algod.AlgodClient("", ALGO_NODE)
 
 # --- State ---
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
             return json.load(f)
-    return {"liquidations": [], "voi_received": 0, "voi_sold": 0, "last_sell_ts": 0}
+    return {"liquidations": []}
 
 def save_state(s):
     with open(STATE_FILE, "w") as f:
@@ -111,84 +116,73 @@ def mcp_call(tool_name, args, timeout=30):
             pass
     raise TimeoutError(f"MCP call {tool_name} timed out")
 
-# --- Get balances ---
-def get_balances():
+# --- Balances ---
+def get_voi_balances():
     headers = {"User-Agent": "Mozilla/5.0"}
-    url = f"{VOI_NODELY}/v2/accounts/{VOI_WALLET}"
+    url = f"{VOI_NODELY}/v2/accounts/{WALLET}"
     r = urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=8)
     d = json.loads(r.read())
-    voi  = d["amount"] / 1e6
+    voi   = d["amount"] / 1e6
     assets = {a["asset-id"]: a["amount"] for a in d.get("assets", [])}
-    ausdc = assets.get(AUSDC_ID, 0) / 1e6
+    ausdc = assets.get(AUSDC_VOI_ID, 0) / 1e6
     return voi, ausdc
 
-# --- Main loop ---
-def run():
-    log.info("=== DorkFi Liquidation Bot Starting ===")
-    log.info(f"Wallet: {VOI_WALLET}")
+def get_algo_balances():
+    headers = {"User-Agent": "Mozilla/5.0"}
+    url = f"{ALGO_NODE}/v2/accounts/{WALLET}"
+    r = urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=8)
+    d = json.loads(r.read())
+    algo  = d["amount"] / 1e6
+    assets = {a["asset-id"]: a["amount"] for a in d.get("assets", [])}
+    usdc  = assets.get(USDC_ALGO_ID, 0) / 1e6
+    return algo, usdc
 
-    state = load_state()
-    voi_bal, ausdc_bal = get_balances()
-    log.info(f"Balances: {voi_bal:,.2f} VOI | ${ausdc_bal:.3f} aUSDC")
+# --- Liquidation runner ---
+def run_chain(chain, client, capital_bal, state):
+    chain_label = chain.upper()
+    debt_symbol = "aUSDC" if chain == "voi" else "USDC"
 
-    if ausdc_bal < 1.0:
-        log.warning("Insufficient aUSDC — need at least $1 to liquidate")
-        return
-
-    # Get liquidation candidates
-    log.info("Fetching liquidation candidates...")
+    log.info(f"[{chain_label}] Fetching liquidation candidates...")
     try:
-        candidates = mcp_call("dorkfi.get_liquidation_candidates", {"chain": "voi"})
+        result = mcp_call("dorkfi.get_liquidation_candidates", {"chain": chain})
     except Exception as e:
-        log.error(f"Failed to get candidates: {e}")
-        return
+        log.error(f"[{chain_label}] Failed to get candidates: {e}")
+        return capital_bal
 
-    # Response is {"candidates": [...], ...}
-    if isinstance(candidates, dict):
-        candidates = candidates.get("candidates", [])
-
-    if not candidates:
-        log.info("No liquidation candidates found")
-        return
-
-    log.info(f"Found {len(candidates)} candidate(s)")
+    candidates = result.get("candidates", []) if isinstance(result, dict) else result
+    log.info(f"[{chain_label}] {len(candidates)} candidate(s) | capital: ${capital_bal:.2f} {debt_symbol}")
 
     for c in candidates:
-        acct       = c.get("address", c.get("account", ""))
-        hf         = float(c.get("healthFactor", c.get("health_factor", 1.0)))
-        borrow_usd = float(c.get("totalBorrowUSD", c.get("totalBorrowUsd", c.get("borrow_usd", 0))))
-
+        acct           = c.get("address", c.get("account", ""))
+        hf             = float(c.get("healthFactor", 1.0))
+        borrow_usd     = float(c.get("totalBorrowUSD", c.get("totalBorrowUsd", 0)))
         collateral_usd = float(c.get("totalCollateralUSD", c.get("totalCollateralUsd", 0)))
+
         log.info(f"  {acct[:12]}... HF={hf:.4f} borrow=${borrow_usd:.2f} collateral=${collateral_usd:.2f}")
 
         if hf >= 1.0:
-            log.info(f"  -> Skipping, HF >= 1.0 (not yet liquidatable)")
+            log.info("  -> Skipping, HF >= 1.0")
             continue
-
         if collateral_usd < 1.0:
-            log.info(f"  -> Skipping, bad debt (collateral ${collateral_usd:.4f} < $1) — nothing to seize")
+            log.info(f"  -> Skipping, bad debt (collateral ${collateral_usd:.4f})")
             continue
 
-        # Amount to repay: 50% of borrow, capped at MAX_PER_TRADE and available aUSDC
-        repay = min(borrow_usd * 0.50, MAX_PER_TRADE, ausdc_bal * 0.95)
+        repay = min(borrow_usd * 0.50, MAX_PER_TRADE, capital_bal * 0.95)
         if repay < 1.0:
-            log.info(f"  -> Skipping, repay amount too small (${repay:.2f})")
+            log.info(f"  -> Skipping, repay too small (${repay:.2f})")
             continue
 
-        log.info(f"  -> Liquidating: repay ${repay:.2f} aUSDC")
+        collateral_symbol = c.get("collateralSymbol", "ALGO" if chain == "algorand" else "VOI")
+        log.info(f"  -> Liquidating: repay ${repay:.2f} {debt_symbol} | seize {collateral_symbol}")
 
         try:
-            # Default: VOI collateral, aUSDC debt (most common on Voi DorkFi)
-            collateral_symbol = c.get("collateralSymbol", c.get("collateral_symbol", "VOI"))
-            debt_symbol       = c.get("debtSymbol", c.get("debt_symbol", "aUSDC"))
-
             txn_data = mcp_call("dorkfi.liquidate_txn", {
-                "chain": "voi",
+                "chain": chain,
                 "borrower": acct,
                 "collateral_symbol": collateral_symbol,
                 "debt_symbol": debt_symbol,
                 "amount": f"{repay:.6f}",
-                "sender": VOI_WALLET
+                "sender": WALLET
             })
 
             txns = txn_data.get("transactions", [])
@@ -196,28 +190,48 @@ def run():
                 log.error("  -> No transactions returned")
                 continue
 
-            # Sign and submit — decode via algosdk to preserve group ID
-            signed_group = []
-            for txn_b64 in txns:
-                txn_obj = encoding.msgpack_decode(txn_b64)
-                signed_group.append(txn_obj.sign(private_key))
-
-            txid = voi_client.send_transactions(signed_group)
-            log.info(f"  -> Liquidation submitted! TxID: {txid}")
+            signed_group = [encoding.msgpack_decode(t).sign(private_key) for t in txns]
+            txid = client.send_transactions(signed_group)
+            log.info(f"  -> Success! TxID: {txid}")
 
             state["liquidations"].append({
                 "ts": datetime.utcnow().isoformat(),
+                "chain": chain,
                 "account": acct,
                 "repaid_usd": repay,
+                "collateral": collateral_symbol,
                 "txid": txid,
-                "hf_at_liq": hf
+                "hf": hf
             })
-            ausdc_bal -= repay
+            capital_bal -= repay
             save_state(state)
 
         except Exception as e:
-            log.error(f"  -> Liquidation failed: {e}")
+            log.error(f"  -> Failed: {e}")
             continue
+
+    return capital_bal
+
+# --- Main ---
+def run():
+    log.info("=== DorkFi Liquidation Bot Starting (Voi + Algorand) ===")
+    state = load_state()
+
+    # Voi
+    voi_bal, ausdc_bal = get_voi_balances()
+    log.info(f"[VOI]  {voi_bal:,.2f} VOI | ${ausdc_bal:.3f} aUSDC")
+    if ausdc_bal >= 1.0:
+        ausdc_bal = run_chain("voi", voi_client, ausdc_bal, state)
+    else:
+        log.warning("[VOI] Insufficient aUSDC — skipping")
+
+    # Algorand
+    algo_bal, usdc_bal = get_algo_balances()
+    log.info(f"[ALGO] {algo_bal:.4f} ALGO | ${usdc_bal:.3f} USDC")
+    if usdc_bal >= 1.0:
+        usdc_bal = run_chain("algorand", algo_client, usdc_bal, state)
+    else:
+        log.warning("[ALGO] Insufficient USDC — skipping")
 
     log.info("=== Run complete ===")
 
