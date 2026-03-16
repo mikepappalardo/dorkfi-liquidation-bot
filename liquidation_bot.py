@@ -18,7 +18,7 @@ WALLET        = "JV7URAS6XGXG7ZH44CWABWZYRIIJPXOWUVNFIJKLKJ3FRTADX2YWEJNO3A"
 STATE_FILE    = os.path.expanduser("~/.openclaw/workspace/liq_bot_state.json")
 LOG_FILE      = os.path.expanduser("~/.openclaw/workspace/liq_bot_output.log")
 RUNNER        = os.path.expanduser("~/.openclaw/workspace/algo_liq_runner.mjs")
-MAX_PER_TRADE = 50.0
+MAX_PER_TRADE = 200.0
 MIN_PROFIT    = 0.50   # skip if estimated profit < $0.50
 
 # Networks
