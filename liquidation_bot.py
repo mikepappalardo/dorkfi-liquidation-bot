@@ -433,6 +433,23 @@ def process_candidate_v2(chain, c, state, liquidate_fn):
     collateral_sym = c.get("collateralSymbol", "")
     debt_sym       = c.get("debtSymbol", "")
 
+    # Auto-detect symbols if not provided by the candidate source
+    all_syms = []
+    if not debt_sym or not collateral_sym:
+        pool_id = c.get("poolId", c.get("appId", 47139778))
+        if chain == "voi":
+            all_syms, debt_sym = detect_symbols_voi(borrower, pool_id)
+            # collateral_sym will be tried from all_syms below
+        if not debt_sym:
+            log.info(f"  {borrower[:20]}... symbol detection failed — skip")
+            return False
+        if not collateral_sym and all_syms:
+            # Will try each non-debt symbol as collateral
+            collateral_sym = next((s for s in all_syms if s != debt_sym), None)
+
+    # Build list of collateral candidates to try (detected or single)
+    collateral_candidates = [s for s in all_syms if s != debt_sym] if all_syms else ([collateral_sym] if collateral_sym else [])
+
     log.info(f"  {borrower[:20]}... HF={hf:.4f} debt=${borrow_usd:.2f} coll=${collateral_usd:.2f} [{debt_sym}→{collateral_sym}]")
 
     if hf >= 1.0:
@@ -446,6 +463,11 @@ def process_candidate_v2(chain, c, state, liquidate_fn):
     max_seize = min(repay * (1 + bonus), collateral_usd)
     est_gas = 0.10
 
+    # If no collateral candidates, nothing to do
+    if not collateral_candidates:
+        log.info(f"  -> Skip: no collateral candidates identified")
+        return False
+
     # Check if we hold the debt token directly
     if has_debt_token(chain, debt_sym, repay):
         est_profit = max_seize - repay - est_gas
@@ -455,8 +477,13 @@ def process_candidate_v2(chain, c, state, liquidate_fn):
         tg_send(f"🦈 <b>Liquidation Opportunity (direct)</b>\n"
                 f"Chain: {chain.upper()} | {borrower[:20]}...\n"
                 f"HF: <b>{hf:.4f}</b> | Repay: <b>${repay:.2f} {debt_sym}</b>\n"
-                f"Seize: <b>{collateral_sym}</b> | Est. profit: <b>${est_profit:.2f}</b>")
-        txid = liquidate_fn(borrower, collateral_sym, debt_sym, repay, state)
+                f"Trying collateral: {collateral_candidates} | Est. profit: <b>${est_profit:.2f}</b>")
+        txid = None
+        for coll_try in collateral_candidates:
+            txid = liquidate_fn(borrower, coll_try, debt_sym, repay, state)
+            if txid:
+                collateral_sym = coll_try
+                break
 
     else:
         # Try swap route
@@ -479,7 +506,12 @@ def process_candidate_v2(chain, c, state, liquidate_fn):
                         f"HF: <b>{hf:.4f}</b> | Swap: <b>{from_sym}→{debt_sym} ${repay:.2f}</b>\n"
                         f"Seize: <b>{collateral_sym}</b> | Est. profit: <b>${est_profit:.2f}</b>")
                 if chain == "voi":
-                    txid = swap_and_liquidate_voi(borrower, collateral_sym, debt_sym, repay, state)
+                    txid = None
+                    for coll_try in collateral_candidates:
+                        txid = swap_and_liquidate_voi(borrower, coll_try, debt_sym, repay, state)
+                        if txid:
+                            collateral_sym = coll_try
+                            break
                 else:
                     log.info(f"  -> Algorand swap-liquidate not yet automated — alert only")
                     return False
@@ -510,3 +542,80 @@ def process_candidate_v2(chain, c, state, liquidate_fn):
 if __name__ == "__main__":
     run()
 
+
+# ── Symbol auto-detection via box reads ────────────────────────────────────────
+
+VOI_POOL_A_MARKETS = {
+    41877720: ("VOI",   6),
+    395614:   ("aUSDC", 6),
+    420069:   ("UNIT",  8),
+    40153155: ("POW",   6),
+    413153:   ("aALGO", 6),
+    40153308: ("aETH",  6),
+    40153415: ("acbBTC",8),
+    47138068: ("WAD",   6),
+}
+ALGO_POOL_B_MARKETS = {
+    3346881192: ("xUSD",   6),
+    3211805086: ("FINITE", 8),
+}
+
+def decode_user_box(value_hex):
+    """Extract borrow/supply balance from a DorkFi user box.
+    The box stores multiple uint256 fields; borrow balance is at a fixed offset."""
+    data = bytes.fromhex(value_hex)
+    # Scan 8-byte chunks for plausible non-zero balances (1e3 to 1e14 range)
+    results = []
+    for i in range(0, len(data) - 7, 4):
+        val = int.from_bytes(data[i:i+8], 'big')
+        if 1_000 < val < 10**14:
+            results.append((i, val))
+    return results
+
+def detect_symbols_voi(borrower, pool_id):
+    """Read on-chain box storage to determine all active market symbols for a borrower.
+    Returns (list_of_all_symbols, debt_sym_guess) — caller should try all as collateral."""
+    from algosdk import encoding as enc
+    import base64, urllib.parse
+
+    try:
+        pk = enc.decode_address(borrower).hex()
+        boxes_url = f"{VOI_NODE}/v2/applications/{pool_id}/boxes"
+        req = urllib.request.Request(boxes_url, headers={"User-Agent": "liq-bot"})
+        d = json.loads(urllib.request.urlopen(req, timeout=10).read())
+
+        user_boxes = []
+        for box in d.get("boxes", []):
+            name = base64.b64decode(box["name"]).hex()
+            if pk[:16] in name and name.startswith("757365727334"):
+                contract_id = int(name[-8:], 16)
+                if contract_id in VOI_POOL_A_MARKETS:
+                    user_boxes.append((contract_id, base64.b64decode(box["name"])))
+
+        positions = {}
+        for contract_id, box_bytes in user_boxes:
+            sym, dec = VOI_POOL_A_MARKETS[contract_id]
+            name_enc = urllib.parse.quote(base64.b64encode(box_bytes).decode(), safe='')
+            url = f"{VOI_NODE}/v2/applications/{pool_id}/box?name=b64%3A{name_enc}"
+            req = urllib.request.Request(url, headers={"User-Agent": "liq-bot"})
+            val = json.loads(urllib.request.urlopen(req, timeout=10).read())
+            value_bytes = base64.b64decode(val['value'])
+            candidates = decode_user_box(value_bytes.hex())
+            if candidates:
+                small_vals = [v for _, v in candidates if v < 10**10]
+                if small_vals:
+                    balance = min(small_vals) / (10 ** dec)
+                    positions[sym] = balance
+
+        log.info(f"  Detected positions for {borrower[:16]}...: {positions}")
+        if not positions:
+            return [], None
+
+        sorted_pos = sorted(positions.items(), key=lambda x: x[1])
+        all_syms = [s for s, _ in sorted_pos]
+        debt_guess = sorted_pos[0][0]  # smallest balance = likely debt
+        return all_syms, debt_guess
+
+    except Exception as e:
+        log.warning(f"  Symbol detection failed: {e}")
+    return [], None
