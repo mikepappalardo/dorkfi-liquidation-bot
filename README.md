@@ -1,66 +1,68 @@
-# DorkFi Liquidation Bot — Voi + Algorand
+# DorkFi Liquidation Bot
 
-Automated liquidation bot for [DorkFi](https://dork.fi) on Voi Network and Algorand.
+Automated liquidation bot for DorkFi lending markets on Voi Network and Algorand.
 
-Monitors undercollateralized positions every 5 minutes across both chains and executes liquidations when profitable.
+## Features
 
-## How It Works
+- **Multi-chain**: Monitors Voi Pool A/B and Algorand Pool A/B simultaneously
+- **Direct liquidation**: Uses held aUSDC/USDC/VOI/ALGO to repay debt and seize collateral
+- **Swap-and-liquidate**: When debt token isn't held, routes through HumbleSwap (Voi) or Pact (Algorand) to acquire it on-the-fly
+- **Telegram alerts**: Notifies on opportunities found, successful liquidations, failures, and bad debt
+- **Bad debt detection**: Skips positions where collateral < 50% of debt (guaranteed loss)
+- **Profitability checks**: Accounts for swap slippage, gas, and liquidation bonus before executing
+- **Monitoring dashboard**: Local web UI at `localhost:8768` showing live positions, bad debt, and risk radar
 
-1. Polls `dorkfi.get_liquidation_candidates` via UluOS MCP gateway (both chains)
-2. Filters out bad debt (collateral < $1) and healthy positions (HF >= 1.0)
-3. Liquidates up to 50% of eligible borrow, capped at $50/trade
-4. Signs and broadcasts transactions directly to Voi and Algorand mainnets
+## Architecture
 
-## Chains & Assets
+```
+liquidation_bot.py      — Main bot (Python), runs every 5 min via cron
+algo_liq_runner.mjs     — Fetches candidates + builds liquidation txns (DorkFiMCP)
+swap_liq_runner.mjs     — Swap quotes + builds swap txns (HumbleSwapMCP / Pact)
+dashboard/
+  server.mjs            — Local API server (Node.js)
+  index.html            — Dashboard UI
+```
 
-| Chain | Repay Asset | Collateral Received | Bonus |
-|-------|-------------|---------------------|-------|
-| Voi | aUSDC (302190) | VOI | +10% |
-| Algorand | USDC (31566704) | ALGO | +6% |
+## Swap-and-Liquidate Flow
 
-## Requirements
+```
+Opportunity detected (HF < 1.0, collateral > 50% of debt)
+       │
+       ▼
+Do we hold the debt token?
+  YES → liquidate directly
+  NO  → get swap quote (HumbleSwap on Voi, Pact on Algorand)
+           ├─ No route → skip
+           ├─ Profit after slippage < $0.05 → skip
+           └─ Route + profitable → swap → liquidate → Telegram alert
+```
 
-- Python 3.9+
-- [UluOS](https://github.com/NautilusOSS/UluOS) MCP gateway running at `http://localhost:3000`
-- Single wallet funded on both chains:
-  - **Voi:** VOI for gas + aUSDC as liquidation capital
-  - **Algorand:** ALGO for gas + USDC as liquidation capital
-- Wallet opted into: aUSDC (Voi), USDC + UNIT + WAD (Algorand)
+## Token Coverage
+
+| Chain | Debt tokens (direct) | Debt tokens (via swap) |
+|---|---|---|
+| Voi | aUSDC, VOI, WAD | UNIT, POW, aALGO, aETH, acbBTC |
+| Algorand | USDC, ALGO | USDC→debt via Pact (where pools exist) |
 
 ## Setup
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env
-# Edit .env with your wallet mnemonic
+cp liq-bot.env.example liq-bot.env  # add LIQUIDATION_BOT_MNEMONIC
+crontab -e  # add: */5 * * * * /path/to/liq_bot_run.sh
+
+# Dashboard
+cd dashboard && node server.mjs
 ```
 
-## Run
+## Dependencies
 
-```bash
-python3 liquidation_bot.py
-```
+- [DorkFiMCP](https://github.com/nautilus-oss/DorkFiMCP) — liquidation tx builder
+- [HumbleSwapMCP](https://github.com/nautilus-oss/HumbleSwapMCP) — Voi DEX swap builder
+- algosdk, python-dotenv
 
-Or via cron (every 5 min):
-```bash
-*/5 * * * * /path/to/liq_bot_run.sh
-```
+## Wallet
 
-## Configuration
+Bot wallet: `JV7URAS6XGXG7ZH44CWABWZYRIIJPXOWUVNFIJKLKJ3FRTADX2YWEJNO3A` (enVoi: gandolfthegrey.voi)
 
-Edit the config block at the top of `liquidation_bot.py`:
-
-| Variable | Default | Description |
-|---|---|---|
-| `WALLET` | — | Your liquidator wallet address (same on both chains) |
-| `MAX_PER_TRADE` | $50 | Max USD per liquidation |
-
-## Security
-
-- Never commit your `.env` file
-- Mnemonic loaded from `LIQUIDATION_BOT_MNEMONIC` environment variable only
-- State tracked in `liq_bot_state.json` (gitignored)
-
-## Disclaimer
-
-Use at your own risk. Liquidation is competitive — positions may be taken by other bots. Always test with small amounts first.
+Capital held: aUSDC (Voi), USDC (Algorand), VOI for gas
